@@ -3,6 +3,7 @@ extern crate regex;
 use std::io::prelude::*;
 use std::env::args;
 use std::process;
+use std::fs::File;
 use std::net::TcpStream;
 use std::collections::HashMap;
 use regex::Regex;
@@ -14,12 +15,16 @@ struct HttpHeaders {
 }
 
 impl HttpHeaders {
-    fn add(&mut self, header: &str) {
-        let split: Vec<&str> = header.split(':').collect();
+    fn add_str(&mut self, header: &str) {
+        let split: Vec<&str> = header.splitn(2, ':').collect();
         let tag = split[0].trim().to_string();
         let value = split[1].trim().to_string();
 
         self.headers.insert(tag, value);
+    }
+
+    fn add(&mut self, tag: &str, value: &str) {
+        self.headers.insert(tag.to_string(), value.to_string());
     }
 
     fn get(&self, tag: &str) -> &str{
@@ -29,7 +34,7 @@ impl HttpHeaders {
     fn to_string(&self) -> String{
         let mut acum = String::new();
         for (tag, value) in &self.headers {
-            acum = acum + &tag + " : " + &value + "\r\n";
+            acum = acum + &tag + ": " + &value + "\r\n";
         }
         acum
     }
@@ -52,33 +57,28 @@ impl HttpMessage {
     }
 
     fn from_str(message: &str) -> HttpMessage {
-        let mut lines = message.lines();
-        let init_line = (&lines.next().unwrap()).to_string();
+        let splitted: Vec<&str> = message.splitn(2, "\r\n\r\n").collect();
+
+        let mut headerlines = splitted[0].lines();
+        let body = splitted[1].to_string();
+
+        let init_line = (&headerlines.next().unwrap()).to_string();
+
         let mut headers = HttpHeaders::new();
-
-        // TODO make this better
-
-        loop {
-            let line = lines.next();
-            match line {
-                Some("") => break,
-                Some(x) => headers.add(x),
-                None    => break,
-            };
+        for line in headerlines {
+            headers.add_str(line);
         }
-
-        let mut body = String::new();
-
-        loop {
-            let line = lines.next();
-            match line {
-                Some(x) => body = body + x + "\r\n",
-                None    => break,
-            };
-        }
-
 
         HttpMessage {init_line: init_line, headers: headers, body: body}
+    }
+
+    // Dpn't use this if the message is not a response
+    fn status_code(&self) -> &str{
+        self.init_line.split_whitespace().collect::<Vec<_>>()[1]
+    }
+
+    fn new() -> HttpMessage {
+        HttpMessage {init_line: String::new(), headers: HttpHeaders::new(), body: String::new()}
     }
 }
 
@@ -88,8 +88,8 @@ fn main() {
 
     let url;
     let dest;
-    let host;
-    let file;
+    //let host;
+    //let file;
 
 
 
@@ -103,39 +103,74 @@ fn main() {
         process::exit(0);
     }
 
-    // Url regex taken from RFC3986 https://tools.ietf.org/html/rfc3986#appendix-B
-    let url_regex = Regex::new(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?").unwrap();
+    let (host, file) = parse_uri(&url);
 
-    let captured = url_regex.captures(&url).unwrap();
+    let mut response = String::new();
 
-    host = captured.at(4).expect("Malformed url");
-    file = match captured.at(5) {
-        Some("") => "/",
-        Some(x)  => x,
-        _        => "/",
-    };
+    let mut connhost = host.to_string();
 
-    let mut stream = TcpStream::connect(&format!("{}:80", host) as &str).unwrap();
+    loop {
+        let mut stream = TcpStream::connect(&format!("{}:80", &connhost) as &str).unwrap();
+        stream.write(request.to_string().as_bytes());
+        stream.read_to_string(&mut response);
+        hresponse = HttpMessage::from_str(&response);
 
 
-    let message = format!("GET {} HTTP/1.1\r\n\
-                        Host: {}\r\n\
-                        Connection: close\r\n\
-                        From: user@user.com\r\n\
-                        User-Agent: badHTTP/0.1\r\n\
-                        \r\n", file, host);
+        let status_code = hresponse.status_code();
+        println!("Handling status code {}", status_code);
 
-    let _ = stream.write(message.as_bytes());
+        if status_code == "301" {
+            let url = hresponse.headers.get("Location");
+            let (host, file) = parse_uri(url);
+            request.init_line = format!("GET {} HTTP/1.1", file);
+            request.headers.add("Host", host);
+            connhost = host.to_string();
+        }else if status_code == "200" {
+            break;
+        } else {
+            println!("Unhandled status code {}", status_code);
+            break;
+        }
 
-    let mut response = String::new(); 
+        response = String::new();        
+    }
 
-    let _ = stream.read_to_string(&mut response);
+    
+
+
 
     let body = HttpMessage::from_str(&response).body;
 
-    println!("Response from server was {:?}", response);
+    //println!("Response from server was {:?}", response);
 
-    println!("body is {}", body);
+    //println!("body is {}", body);
+
+    let mut body_file = match File::create(&dest) {
+        Err(_)      => panic!("Coudln't create file"),
+        Ok(file)    => file,
+    };
+
+    match body_file.write_all(body.as_bytes()) {
+        Err(_)      => panic!("Coudln't write to file"),
+        Ok(_)       => println!("Copied contents from {} into {}", url, dest),
+    };
 
 
+}
+
+fn parse_uri(uri: &str) -> (&str, &str) {
+
+    // Url regex taken from RFC3986 https://tools.ietf.org/html/rfc3986#appendix-B
+    let url_regex = Regex::new(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?").unwrap();
+
+    let captured = url_regex.captures(uri).unwrap();
+
+    println!("{}", uri);
+
+    let host = captured.at(4).expect("Malformed url").trim();
+    let file = captured.at(5).expect("Malformed url").trim();
+
+    println!("host {} file {}", host, file);
+
+    (host, file)
 }
