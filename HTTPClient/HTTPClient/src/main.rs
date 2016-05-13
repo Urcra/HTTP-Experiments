@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use regex::Regex;
 
 
-
 struct HttpHeaders {
     headers: HashMap<String, String>
 }
@@ -88,10 +87,6 @@ fn main() {
 
     let url;
     let dest;
-    //let host;
-    //let file;
-
-
 
     let args: Vec<String> = args().collect();
 
@@ -108,6 +103,13 @@ fn main() {
     let mut response = String::new();
 
     let mut connhost = host.to_string();
+
+    let mut request = HttpMessage::new();
+    let mut hresponse = HttpMessage::new();
+
+    request.init_line = format!("GET {} HTTP/1.1", file);
+    request.headers.add("Host", host);
+    request.headers.add("Connection", "close");
 
     loop {
         let mut stream = TcpStream::connect(&format!("{}:80", &connhost) as &str).unwrap();
@@ -132,11 +134,8 @@ fn main() {
             break;
         }
 
-        response = String::new();        
+        response = String::new();
     }
-
-    
-
 
 
     let body = HttpMessage::from_str(&response).body;
@@ -154,8 +153,6 @@ fn main() {
         Err(_)      => panic!("Coudln't write to file"),
         Ok(_)       => println!("Copied contents from {} into {}", url, dest),
     };
-
-
 }
 
 fn parse_uri(uri: &str) -> (&str, &str) {
