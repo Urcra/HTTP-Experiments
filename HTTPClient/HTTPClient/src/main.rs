@@ -31,12 +31,10 @@ fn main() {
 
     let stream = send_request(host, file);
 
-    let (init_line, mut headers, stream) = parse_response_head(stream);
+    let (init_line, mut headers, mut reader) = parse_response_head(stream);
 
 
     let mut buffer = String::new();
-    let mut reader = BufReader::new(&stream);
-
 
 
     if let Some(encoding) = headers.get("Transfer-Encoding") {
@@ -92,13 +90,13 @@ fn send_request<'a>(host: &str, file: &str) -> TcpStream {
     stream
 }
 
-fn parse_response_head(stream: TcpStream) -> (String, HashMap<String, String>, TcpStream) {
+fn parse_response_head<'a>(stream: TcpStream) -> (String, HashMap<String, String>, BufReader<TcpStream>) {
     let mut buffer = String::new();
     let mut init_line = String::new();
     let mut headers = HashMap::new();
     // More fun lifetimes hacks
-    {
-        let mut reader = BufReader::new(&stream);
+    
+        let mut reader = BufReader::new(stream);
 
         let _ = reader.read_line(&mut init_line);
 
@@ -119,8 +117,8 @@ fn parse_response_head(stream: TcpStream) -> (String, HashMap<String, String>, T
                 buffer.clear();
             }
         }
-    }
-    (init_line, headers, stream)
+    
+    (init_line, headers, reader)
 }
 
 fn parse_uri(uri: &str) -> (&str, &str) {
