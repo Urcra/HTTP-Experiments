@@ -1,0 +1,8 @@
+[package]
+name = "goose_pond"
+version = "0.1.0"
+authors = ["urcra <urcra@urcra.com>"]
+
+[dependencies]
+chrono = "0.2"
+time = "0.1"
