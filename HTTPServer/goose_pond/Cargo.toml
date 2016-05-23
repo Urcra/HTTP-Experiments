@@ -4,5 +4,6 @@ version = "0.1.0"
 authors = ["urcra <urcra@urcra.com>"]
 
 [dependencies]
-chrono = "0.2"
+mio = "0.5"
+mioco = "*"
 time = "0.1"
