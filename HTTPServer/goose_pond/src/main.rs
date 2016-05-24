@@ -2,14 +2,21 @@
 
 extern crate time;
 #[macro_use] extern crate mioco;
+extern crate mio;
 
+
+use mio::*;
+use mio::tcp::*;
+use std::collections::HashMap;
+
+use std::fs::File;
 
 use time::*;
 use std::str;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::io::{self, Write, Read};
-use mioco::tcp::TcpListener;
+
 
 #[derive(Debug)]
 enum RequestType {
@@ -25,21 +32,21 @@ enum RequestType {
 }
 
 #[derive(Debug)]
-struct HTTPHeader<'a> {
+struct HTTPHeader {
     //Iinital line
-    Protocol: Option<&'a str>,
-    ProtocolVer: Option<&'a str>,
-    FilePath: Option<&'a str>,
+    Protocol: Option<String>,
+    ProtocolVer: Option<String>,
+    FilePath: Option<String>,
     Type: Option<RequestType>,
     //Header tags
-    Connection: Option<&'a str>,
-    Host: Option<&'a str>,
+    Connection: Option<String>,
+    Host: Option<String>,
     IfModifiedSince: Option<Tm>,
     IfUnmodifiedSince: Option<Tm>,
 }
 
-impl <'a> HTTPHeader<'a> {
-    fn new() -> HTTPHeader<'a>{
+impl HTTPHeader {
+    fn new() -> HTTPHeader{
         HTTPHeader {
             Protocol: None,
             ProtocolVer: None,
@@ -51,7 +58,7 @@ impl <'a> HTTPHeader<'a> {
             IfUnmodifiedSince: None
         }
     }
-    fn insert_init_line(&mut self, s: &'a str) -> Result<&'static str, &'static str> {
+    fn insert_init_line(&mut self, s: &str) -> Result<&'static str, &'static str> {
 
         let mut splitted = s.split_whitespace();
 
@@ -70,7 +77,7 @@ impl <'a> HTTPHeader<'a> {
         let (reqtype, path, fullprot) = initline;
 
 
-        self.FilePath = Some(path);
+        self.FilePath = Some(path.to_string());
         self.Type = Some(reqtype_from_str(reqtype));
 
 
@@ -85,14 +92,14 @@ impl <'a> HTTPHeader<'a> {
         let (prot, vers) = fullprot.split_at(middle);
 
 
-        self.Protocol = Some(prot.trim());
-        self.ProtocolVer = Some(vers[1..].trim());
+        self.Protocol = Some(prot.trim().to_string());
+        self.ProtocolVer = Some((vers[1..].trim()).to_string());
 
 
         Result::Ok("OK")
     }
 
-    fn insert_tag(&mut self, s: &'a str) -> Result<&'static str, &'static str>{
+    fn insert_tag(&mut self, s: &str) -> Result<&'static str, &'static str>{
         let middle;
 
         match s.find(":") {
@@ -104,8 +111,8 @@ impl <'a> HTTPHeader<'a> {
 
 
         match header.trim() {
-            "Connection" => self.Connection = Some(tag[1..].trim()),
-            "Host" => self.Host = Some(tag[1..].trim()),
+            "Connection" => self.Connection = Some((tag[1..].trim()).to_string()),
+            "Host" => self.Host = Some((tag[1..].trim()).to_string()),
             "If-Modified-Since" => match date_from_str(tag[1..].trim()) {
                             Ok(t) => self.IfModifiedSince = Some(t),
                             Err(e) => return Result::Err(e),
@@ -121,7 +128,7 @@ impl <'a> HTTPHeader<'a> {
         Result::Ok("OK")
     }
 
-    fn parse_req(&mut self, req: &'a [u8]) -> Result<(),()>{
+    fn parse_req(&mut self, req: &[u8]) -> Result<(),()>{
 
         let mut len = 0;
 
@@ -154,6 +161,13 @@ impl <'a> HTTPHeader<'a> {
 // Make my own
 const RESPONSE: &'static str = "HTTP/1.1 200 OK\r
 Content-Length: 14\r
+Connection: close\r
+\r
+Hello World\r
+\r";
+
+const RESPONSE_PERS: &'static str = "HTTP/1.1 200 OK\r
+Content-Length: 14\r
 \r
 Hello World\r
 \r";
@@ -164,6 +178,138 @@ Connection: close\r
 \r
 Hello World_404\r
 \r";
+
+
+const RESPONSE_NULL: &'static str = "\0";
+
+
+
+
+
+
+
+
+
+
+struct HTTPConn {
+    socket: TcpStream,
+    headers: HTTPHeader,
+    interest: EventSet,
+}
+
+impl HTTPConn {
+    fn new(socket: TcpStream) -> HTTPConn {
+        let headers = HTTPHeader::new();
+
+        HTTPConn {
+            socket: socket,
+            headers: headers,
+            interest: EventSet::readable(),
+        }
+    }
+
+    fn write(&mut self) {
+        //let headers = self.headers;
+
+
+        match self.headers.FilePath {
+            Some(ref f) => {self.socket.try_write(RESPONSE.as_bytes()).unwrap();},
+            None    => {println!("heyo");},
+        };
+        /*let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
+                                                 Connection: Upgrade\r\n\
+                                                 Sec-WebSocket-Accept: {}\r\n\
+                                                 Upgrade: websocket\r\n\r\n", response_key));*/
+        self.socket.try_write(RESPONSE.as_bytes()).unwrap();
+
+        self.interest.remove(EventSet::writable());
+        //self.interest.insert(EventSet::readable());
+    }
+
+    fn read(&mut self) {
+        loop {
+            let mut buf = [0; 2048];
+            match self.socket.try_read(&mut buf) {
+                Err(e) => {
+                    println!("Error while reading socket: {:?}", e);
+                    return
+                },
+                Ok(None) =>
+                    // Socket buffer has got no more bytes.
+                    break,
+                Ok(Some(len)) => {
+                    //println!("readsocket");
+                    //self.http_parser.parse(&buf);
+                    let res = self.headers.parse_req(&buf);
+
+                    if res == Ok(()) {
+                        // Change the current state
+                        //self.state = ClientState::HandshakeResponse;
+
+                        // Change current interest to `Writable`
+                        self.interest.remove(EventSet::readable());
+                        self.interest.insert(EventSet::writable());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct WebSocketServer {
+    socket: TcpListener,
+    clients: HashMap<Token, HTTPConn>,
+    token_counter: usize
+}
+
+const SERVER_TOKEN: Token = Token(0);
+
+impl Handler for WebSocketServer {
+    type Timeout = usize;
+    type Message = ();
+
+    fn ready(&mut self, event_loop: &mut EventLoop<WebSocketServer>, token: Token, events: EventSet) {
+        if events.is_readable() {
+            match token {
+                SERVER_TOKEN => {
+                    let client_socket = match self.socket.accept() {
+                        Ok(Some((sock, addr))) => sock,
+                        Ok(None) => unreachable!(),
+                        Err(e) => {
+                            println!("Accept error: {}", e);
+                            return;
+                        }
+                    };
+
+                    let new_token = Token(self.token_counter);
+                    self.clients.insert(new_token, HTTPConn::new(client_socket));
+                    self.token_counter += 1;
+
+                    event_loop.register(&self.clients[&new_token].socket, new_token, EventSet::readable(),
+                                        PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                },
+            token => {
+                    let mut client = self.clients.get_mut(&token).unwrap();
+                    client.read();
+                    event_loop.reregister(&client.socket, token, client.interest,
+                                          PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                }
+            }
+        }
+
+        if events.is_writable() {
+            let mut client = self.clients.get_mut(&token).unwrap();
+            client.write();
+            event_loop.reregister(&client.socket, token, client.interest,
+                                  PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        }
+    }
+}
+
+
+
+
 
 
 fn main() {
@@ -197,9 +343,36 @@ fn main() {
 
     //println!("{:?}", read_line(test));
 
-    let addr: SocketAddr = FromStr::from_str("127.0.0.1:5555").unwrap();
+    //let addr: SocketAddr = FromStr::from_str("127.0.0.1:5555").unwrap();
 
-    let listener = TcpListener::bind(&addr).unwrap();
+    //let listener = TcpListener::bind(&addr).unwrap();
+
+
+
+
+
+    let address = "127.0.0.1:5555".parse::<SocketAddr>().unwrap();
+    let server_socket = TcpListener::bind(&address).unwrap();
+
+    let mut event_loop = EventLoop::new().unwrap();
+
+    let mut server = WebSocketServer {
+        token_counter: 1,
+        clients: HashMap::new(),
+        socket: server_socket
+    };
+
+    event_loop.register(&server.socket,
+                        SERVER_TOKEN,
+                        EventSet::readable(),
+                        PollOpt::edge()).unwrap();
+    event_loop.run(&mut server).unwrap();
+
+
+
+
+
+    /*
 
 
     // Supporting persistent connections woo
@@ -209,23 +382,18 @@ fn main() {
             mioco::spawn(move || {
                 loop {
                     let mut conn = listener.accept().unwrap();
-                    let mut timer = mioco::timer::Timer::new();
                     mioco::spawn(move || -> io::Result<()> {
                         let mut buf_i = 0;
                         let mut buf = [0u8; 1024];
+                        let mut foo = Vec::new();
+
+                        let mut msg: Vec<u8> = Vec::new();
+
+                        msg.extend_from_slice(RESPONSE.as_bytes());
                         
 
                         
-                            
-                            //timer.set_timeout(10);
 
-                            select!( r:timer => {
-                                        println!("waited to long");
-                                        conn.shutdown(mioco::tcp::Shutdown::Both).unwrap();
-                                    },
-                                     r:conn => {
-                                        println!("hello");
-                                     },);
 
                             loop {
                                 let mut headers = HTTPHeader::new();
@@ -233,11 +401,8 @@ fn main() {
                                 let len = try!(conn.read(&mut buf[buf_i..]));
 
                                 if len == 0 {
-                                    
+                                    // Spurrious event can fire, so check if we actually receive something.
                                     return Ok(());
-                                } else {
-                                    //Reset timeout since we got some data
-                                    timer.set_timeout(100);
                                 }
 
                                 buf_i += len;
@@ -245,15 +410,40 @@ fn main() {
                                 let res = headers.parse_req(&buf[0..buf_i]);
 
                                 if res == Ok(()) {
-                                    //println!("{:?}", headers);
                                     match headers.FilePath {
                                         Some(path) => {
-                                            try!(conn.write_all(&RESPONSE.as_bytes()));
+
+                                            mioco::sync( || -> io::Result<()> {
+                                                println!("here1");
+                                            let mut f = try!(File::open("foo.txt"));
+                                            println!("here2");
+                                            println!("here3");
+                                            try!(f.read_to_end(&mut foo));
+                                            //println!("{:?}", foo);
+                                            println!("here4");
+
+                                            
+                                            return Ok(());
+                                            }
+                                            );
+                                            println!("writing foo");
+
+                                            msg.append(&mut foo);
+
+                                            try!(conn.write_all(&msg));
+
+                                            //try!(conn.write_all(&foo));
+
+                                            //try!(conn.write_all(&RESPONSE_NULL.as_bytes()));
+
+                                            //try!(conn.write_all(&RESPONSE.as_bytes()));
+                                            
                                             buf_i = 0;
+                                            return Ok(());
                                         },                                               
                                         None       => {
                                             try!(conn.write_all(&RESPONSE.as_bytes()));
-                                            //buf_i = 0;
+                                            buf_i = 0;
                                             return Ok(());
                                         },
                                     }
@@ -298,7 +488,7 @@ fn main() {
     }).unwrap();
 
 
-
+    */
 }
 
 fn date_from_str(s: &str) -> Result<Tm, &'static str> {
