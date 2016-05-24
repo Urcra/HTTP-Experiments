@@ -1,8 +1,15 @@
+#![recursion_limit="500"]
+
 extern crate time;
-extern crate mioco;
+#[macro_use] extern crate mioco;
+
 
 use time::*;
 use std::str;
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::io::{self, Write, Read};
+use mioco::tcp::TcpListener;
 
 #[derive(Debug)]
 enum RequestType {
@@ -99,11 +106,11 @@ impl <'a> HTTPHeader<'a> {
         match header.trim() {
             "Connection" => self.Connection = Some(tag[1..].trim()),
             "Host" => self.Host = Some(tag[1..].trim()),
-            "IfModifiedSince" => match date_from_str(tag[1..].trim()) {
+            "If-Modified-Since" => match date_from_str(tag[1..].trim()) {
                             Ok(t) => self.IfModifiedSince = Some(t),
                             Err(e) => return Result::Err(e),
                             },
-            "IfUnmodifiedSince" => match date_from_str(tag[1..].trim()) {
+            "If-Content-Length: 14\rUnmodified-Since" => match date_from_str(tag[1..].trim()) {
                             Ok(t) => self.IfUnmodifiedSince = Some(t),
                             Err(e) => return Result::Err(e),
                             },
@@ -144,11 +151,24 @@ impl <'a> HTTPHeader<'a> {
         Result::Ok(())
     }
 }
+// Make my own
+const RESPONSE: &'static str = "HTTP/1.1 200 OK\r
+Content-Length: 14\r
+\r
+Hello World\r
+\r";
 
+const RESPONSE_404: &'static str = "HTTP/1.1 404 Not Found\r
+Content-Length: 18\r
+Connection: close\r
+\r
+Hello World_404\r
+\r";
 
 
 fn main() {
-    println!("Hello, world!");
+    //println!("Hello, world!");
+
 
     let tmpstring = "Connection : close".to_string();
     let tmpinit = "GET /path/file.html HTTP/1.0".to_string();
@@ -170,12 +190,112 @@ fn main() {
 
     tmpheaders.parse_req(message.as_bytes());
 
-    println!("{:?}", tmpheaders);
+    //println!("{:?}", tmpheaders);
 
 
-    println!("{:?}", tmpheader);
+    //println!("{:?}", tmpheader);
 
-    println!("{:?}", read_line(test));
+    //println!("{:?}", read_line(test));
+
+    let addr: SocketAddr = FromStr::from_str("127.0.0.1:5555").unwrap();
+
+    let listener = TcpListener::bind(&addr).unwrap();
+
+
+    // Supporting persistent connections woo
+    mioco::start(move || {
+        for _ in 0..mioco::thread_num() {
+            let listener = listener.try_clone().unwrap();
+            mioco::spawn(move || {
+                loop {
+                    let mut conn = listener.accept().unwrap();
+                    let mut timer = mioco::timer::Timer::new();
+                    mioco::spawn(move || -> io::Result<()> {
+                        let mut buf_i = 0;
+                        let mut buf = [0u8; 1024];
+                        
+
+                        
+                            
+                            //timer.set_timeout(10);
+
+                            select!( r:timer => {
+                                        println!("waited to long");
+                                        conn.shutdown(mioco::tcp::Shutdown::Both).unwrap();
+                                    },
+                                     r:conn => {
+                                        println!("hello");
+                                     },);
+
+                            loop {
+                                let mut headers = HTTPHeader::new();
+
+                                let len = try!(conn.read(&mut buf[buf_i..]));
+
+                                if len == 0 {
+                                    
+                                    return Ok(());
+                                } else {
+                                    //Reset timeout since we got some data
+                                    timer.set_timeout(100);
+                                }
+
+                                buf_i += len;
+
+                                let res = headers.parse_req(&buf[0..buf_i]);
+
+                                if res == Ok(()) {
+                                    //println!("{:?}", headers);
+                                    match headers.FilePath {
+                                        Some(path) => {
+                                            try!(conn.write_all(&RESPONSE.as_bytes()));
+                                            buf_i = 0;
+                                        },                                               
+                                        None       => {
+                                            try!(conn.write_all(&RESPONSE.as_bytes()));
+                                            //buf_i = 0;
+                                            return Ok(());
+                                        },
+                                    }
+                                }
+                            }
+                        
+
+
+                        /*
+                        loop {
+                            let mut headers = HTTPHeader::new();
+
+                            let len = try!(conn.read(&mut buf[buf_i..]));
+
+                            if len == 0 {
+                                return Ok(());
+                            }
+
+                            buf_i += len;
+
+                            let res = headers.parse_req(&buf[0..buf_i]);
+
+                            if res == Ok(()) {
+                                //println!("{:?}", headers);
+                                match headers.FilePath {
+                                    Some(path) => {
+                                        try!(conn.write_all(&RESPONSE.as_bytes()));
+                                        buf_i = 0;
+                                    },
+                                    None       => {
+                                        try!(conn.write_all(&RESPONSE.as_bytes()));
+                                        return Ok(());
+                                    },
+                                }
+                            }
+                        }*/
+
+                    });
+                }
+            });
+        }
+    }).unwrap();
 
 
 
