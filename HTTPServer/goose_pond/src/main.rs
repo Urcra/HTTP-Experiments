@@ -350,7 +350,15 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
         let lastmod = metadata.modified().unwrap();
 
         let currenttime = time::get_time();
-        let timesinceifmod = (currenttime - time.to_timespec()).to_std().unwrap();
+        let timesinceifmod; 
+        // Dates in the future causes trouble
+        match (currenttime - time.to_timespec()).to_std() {
+            Ok(t) => timesinceifmod = t,
+            Err(_) => {
+                send_error(stream, "400 Bad Request", "Date is in the future", requesttype);
+                return;
+            },
+        };
         let timesincemod = lastmod.elapsed().unwrap();
 
         if timesinceifmod < timesincemod {
@@ -365,7 +373,15 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
         let lastmod = metadata.modified().unwrap();
 
         let currenttime = time::get_time();
-        let timesinceifmod = (currenttime - time.to_timespec()).to_std().unwrap();
+        let timesinceifmod; 
+        // Dates in the future causes trouble
+        match (currenttime - time.to_timespec()).to_std() {
+            Ok(t) => timesinceifmod = t,
+            Err(_) => {
+                send_error(stream, "400 Bad Request", "Date is in the future", requesttype);
+                return;
+            },
+        };
         let timesincemod = lastmod.elapsed().unwrap();
 
         if timesinceifmod > timesincemod {
@@ -586,3 +602,225 @@ fn main() {
     }
 }
 
+/* TESTING */
+
+
+#[test]
+fn test_parsedates() {
+    // Try to parse each of the three possible formats, will panic if either returns an error
+    date_from_str("Fri, 31 Dec 1999 23:59:59 GMT").unwrap();
+    date_from_str("Friday, 31-Dec-99 23:59:59 GMT").unwrap();
+    date_from_str("Fri Dec 31 23:59:59 1999").unwrap();
+}
+
+#[test]
+fn test_abs_path() {
+    // Make sure that the absolute path can be parsed correctly
+    assert_eq!(from_absolute("http://www.somehost.com/path/file.html").unwrap(), "/path/file.html");
+    assert_eq!(from_absolute("http://www.somehost.com:80/path/file.html").unwrap(), "/path/file.html");
+}
+
+
+#[test]
+fn test_read_line() {
+    // Tests for read line
+
+    let linedmsg = "foo\r\nbar\r\n";
+
+    // First line should be foo
+    let read = read_line(linedmsg.as_bytes()).unwrap();
+    assert_eq!(read, "foo\r\n");
+
+    // Second line should be bar
+    let readtwo = read_line(linedmsg[read.len()..].as_bytes()).unwrap();
+    assert_eq!(readtwo, "bar\r\n");
+}
+
+
+#[test]
+#[should_panic]
+fn test_read_line_fail() {
+    // Test to make sure it fails when EOF
+
+    let linedmsg = "";
+
+    // This should fail since the unwrap will panic as it tries to unwrap an error
+    let read = read_line(linedmsg.as_bytes()).unwrap();
+    assert_eq!(read, "");
+}
+
+#[test]
+fn test_parse_req_normal_get() {
+    // Test to make sure we can parse a normal request
+
+    let req = "GET /path.ending HTTP/1.1\r\n\
+    User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n\
+    Host: localhost\r\n\
+    Accept-Language: en-us\r\n\
+    Accept-Encoding: gzip, deflate\r\n\
+    Connection: Keep-Alive\r\n\
+    \r\n".as_bytes();
+
+    let mut header = HTTPHeader::new();
+
+
+    let parse_result = header.parse_req(req);
+
+    // Check if the result was ok
+    parse_result.unwrap();
+
+    // Check to see if our supported headers got added as we wanted
+    assert_eq!(header.Type, Some(RequestType::GET));
+    assert_eq!(header.Connection, Some("Keep-Alive"));
+    assert_eq!(header.Protocol, Some("HTTP"));
+    assert_eq!(header.ProtocolVer, Some("1.1"));
+    assert_eq!(header.FilePath, Some("/path.ending"));
+}
+
+#[test]
+fn test_parse_req_normal_head() {
+    // Test to make sure we can parse a normal request
+
+    let req = "HEAD /path.ending HTTP/1.1\r\n\
+    User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n\
+    Host: localhost\r\n\
+    Accept-Language: en-us\r\n\
+    Accept-Encoding: gzip, deflate\r\n\
+    Connection: Keep-Alive\r\n\
+    \r\n".as_bytes();
+
+    let mut header = HTTPHeader::new();
+
+
+    let parse_result = header.parse_req(req);
+
+    // Check if the result was ok
+    parse_result.unwrap();
+
+    // Check to see if our supported headers got added as we wanted
+    assert_eq!(header.Type, Some(RequestType::HEAD));
+    assert_eq!(header.Connection, Some("Keep-Alive"));
+    assert_eq!(header.Protocol, Some("HTTP"));
+    assert_eq!(header.ProtocolVer, Some("1.1"));
+    assert_eq!(header.FilePath, Some("/path.ending"));
+}
+
+#[test]
+#[should_panic]
+fn test_parse_req_missing_blankline() {
+    // Oh no they forgot the last blankline
+    // We should report an error
+
+    let req = "HEAD /path.ending HTTP/1.1\r\n\
+    User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n\
+    Host: localhost\r\n\
+    Accept-Language: en-us\r\n\
+    Accept-Encoding: gzip, deflate\r\n\
+    Connection: Keep-Alive\r\n".as_bytes();
+
+    let mut header = HTTPHeader::new();
+
+
+    let parse_result = header.parse_req(req);
+
+    // Check if the result was ok
+    parse_result.unwrap();
+
+    // Check to see if our supported headers got added as we wanted
+    assert_eq!(header.Type, Some(RequestType::HEAD));
+    assert_eq!(header.Connection, Some("Keep-Alive"));
+    assert_eq!(header.Protocol, Some("HTTP"));
+    assert_eq!(header.ProtocolVer, Some("1.1"));
+    assert_eq!(header.FilePath, Some("/path.ending"));
+}
+
+
+#[test]
+#[should_panic]
+fn test_parse_req_missing_type() {
+    // Oh no they forgot to set the request type
+    // We should report an error
+
+    let req = "/path.ending HTTP/1.1\r\n\
+    User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n\
+    Host: localhost\r\n\
+    Accept-Language: en-us\r\n\
+    Accept-Encoding: gzip, deflate\r\n\
+    Connection: Keep-Alive\r\n\
+    \r\n".as_bytes();
+
+    let mut header = HTTPHeader::new();
+
+
+    let parse_result = header.parse_req(req);
+
+    // Check if the result was ok
+    parse_result.unwrap();
+
+    // Check to see if our supported headers got added as we wanted
+    assert_eq!(header.Type, Some(RequestType::HEAD));
+    assert_eq!(header.Connection, Some("Keep-Alive"));
+    assert_eq!(header.Protocol, Some("HTTP"));
+    assert_eq!(header.ProtocolVer, Some("1.1"));
+    assert_eq!(header.FilePath, Some("/path.ending"));
+}
+
+#[test]
+#[should_panic]
+fn test_parse_req_missing_protocol() {
+    // Oh no they forgot to set the protocol
+    // We should report an error
+
+    let req = "GET /path.ending\r\n\
+    User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n\
+    Host: localhost\r\n\
+    Accept-Language: en-us\r\n\
+    Accept-Encoding: gzip, deflate\r\n\
+    Connection: Keep-Alive\r\n\
+    \r\n".as_bytes();
+
+    let mut header = HTTPHeader::new();
+
+
+    let parse_result = header.parse_req(req);
+
+    // Check if the result was ok
+    parse_result.unwrap();
+
+    // Check to see if our supported headers got added as we wanted
+    assert_eq!(header.Type, Some(RequestType::HEAD));
+    assert_eq!(header.Connection, Some("Keep-Alive"));
+    assert_eq!(header.Protocol, Some("HTTP"));
+    assert_eq!(header.ProtocolVer, Some("1.1"));
+    assert_eq!(header.FilePath, Some("/path.ending"));
+}
+
+#[test]
+#[should_panic]
+fn test_parse_req_missing_filepath() {
+    // Oh no they forgot to set the filepath
+    // We should report an error
+
+    let req = "GET HTTP/1.1\r\n\
+    User-Agent: Mozilla/4.0 (compatible; MSIE5.01; Windows NT)\r\n\
+    Host: localhost\r\n\
+    Accept-Language: en-us\r\n\
+    Accept-Encoding: gzip, deflate\r\n\
+    Connection: Keep-Alive\r\n\
+    \r\n".as_bytes();
+
+    let mut header = HTTPHeader::new();
+
+
+    let parse_result = header.parse_req(req);
+
+    // Check if the result was ok
+    parse_result.unwrap();
+
+    // Check to see if our supported headers got added as we wanted
+    assert_eq!(header.Type, Some(RequestType::HEAD));
+    assert_eq!(header.Connection, Some("Keep-Alive"));
+    assert_eq!(header.Protocol, Some("HTTP"));
+    assert_eq!(header.ProtocolVer, Some("1.1"));
+    assert_eq!(header.FilePath, Some("/path.ending"));
+}
