@@ -7,3 +7,5 @@ authors = ["urcra <urcra@urcra.com>"]
 mio = "0.5"
 mioco = "*"
 time = "0.1"
+clap = "2"
+regex = "0.1"

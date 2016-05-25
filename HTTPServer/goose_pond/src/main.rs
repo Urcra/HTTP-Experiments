@@ -1,21 +1,31 @@
-#![recursion_limit="500"]
-
+#![feature(fs_time)] 
 extern crate time;
-#[macro_use] extern crate mioco;
-extern crate mio;
+extern crate clap;
+extern crate regex;
 
 
-use mio::*;
-use mio::tcp::*;
-use std::collections::HashMap;
-
+use std::io::prelude::*;
+use std::sync::Arc;
+use std::path::PathBuf;
+use std::path::Path;
 use std::fs::File;
-
+use clap::{App, Arg, SubCommand};
 use time::*;
 use std::str;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::io::{self, Write, Read};
+//use std::io::{self, Write, Read};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use regex::Regex;
+//use mioco::tcp::TcpListener;
+
+
+#[derive(Debug)]
+struct ServerConfig {
+    fileroot: String,
+    address: SocketAddr,
+}
 
 
 #[derive(Debug)]
@@ -32,21 +42,21 @@ enum RequestType {
 }
 
 #[derive(Debug)]
-struct HTTPHeader {
+struct HTTPHeader<'a> {
     //Iinital line
-    Protocol: Option<String>,
-    ProtocolVer: Option<String>,
-    FilePath: Option<String>,
+    Protocol: Option<&'a str>,
+    ProtocolVer: Option<&'a str>,
+    FilePath: Option<&'a str>,
     Type: Option<RequestType>,
     //Header tags
-    Connection: Option<String>,
-    Host: Option<String>,
+    Connection: Option<&'a str>,
+    Host: Option<&'a str>,
     IfModifiedSince: Option<Tm>,
     IfUnmodifiedSince: Option<Tm>,
 }
 
-impl HTTPHeader {
-    fn new() -> HTTPHeader{
+impl <'a> HTTPHeader<'a> {
+    fn new() -> HTTPHeader<'a>{
         HTTPHeader {
             Protocol: None,
             ProtocolVer: None,
@@ -58,7 +68,7 @@ impl HTTPHeader {
             IfUnmodifiedSince: None
         }
     }
-    fn insert_init_line(&mut self, s: &str) -> Result<&'static str, &'static str> {
+    fn insert_init_line(&mut self, s: &'a str) -> Result<&'static str, &'static str> {
 
         let mut splitted = s.split_whitespace();
 
@@ -77,7 +87,7 @@ impl HTTPHeader {
         let (reqtype, path, fullprot) = initline;
 
 
-        self.FilePath = Some(path.to_string());
+        self.FilePath = Some(path);
         self.Type = Some(reqtype_from_str(reqtype));
 
 
@@ -92,14 +102,14 @@ impl HTTPHeader {
         let (prot, vers) = fullprot.split_at(middle);
 
 
-        self.Protocol = Some(prot.trim().to_string());
-        self.ProtocolVer = Some((vers[1..].trim()).to_string());
+        self.Protocol = Some(prot.trim());
+        self.ProtocolVer = Some(vers[1..].trim());
 
 
         Result::Ok("OK")
     }
 
-    fn insert_tag(&mut self, s: &str) -> Result<&'static str, &'static str>{
+    fn insert_tag(&mut self, s: &'a str) -> Result<&'static str, &'static str>{
         let middle;
 
         match s.find(":") {
@@ -111,8 +121,8 @@ impl HTTPHeader {
 
 
         match header.trim() {
-            "Connection" => self.Connection = Some((tag[1..].trim()).to_string()),
-            "Host" => self.Host = Some((tag[1..].trim()).to_string()),
+            "Connection" => self.Connection = Some(tag[1..].trim()),
+            "Host" => self.Host = Some(tag[1..].trim()),
             "If-Modified-Since" => match date_from_str(tag[1..].trim()) {
                             Ok(t) => self.IfModifiedSince = Some(t),
                             Err(e) => return Result::Err(e),
@@ -128,7 +138,7 @@ impl HTTPHeader {
         Result::Ok("OK")
     }
 
-    fn parse_req(&mut self, req: &[u8]) -> Result<(),()>{
+    fn parse_req(&mut self, req: &'a [u8]) -> Result<(),&'static str>{
 
         let mut len = 0;
 
@@ -138,7 +148,7 @@ impl HTTPHeader {
                 self.insert_init_line(s.trim());
                 len += s.len()
             },
-            Err(_) => return Result::Err(()),
+            Err(_) => return Result::Err("Missing line ending"),
         };
 
         //Parse rest of headers
@@ -146,10 +156,13 @@ impl HTTPHeader {
             match read_line(&req[len..]) {
                 Ok("\r\n") => break,
                 Ok(s) => {
-                    self.insert_tag(s.trim());
-                    len += s.len()
+                    match self.insert_tag(s.trim()){
+                        Ok(_) => len += s.len(),
+                        Err(e) => return Result::Err(e),
+                    };
+                    
                 },
-                Err(_) => return Result::Err(()),
+                Err(_) => return Result::Err("Missing line ending"),
             }
         }
 
@@ -183,137 +196,212 @@ Hello World_404\r
 const RESPONSE_NULL: &'static str = "\0";
 
 
+fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
+
+    //println!("{:?}", fileroot);
+
+    let ref derefed = **fileroot;
+    let mut path = PathBuf::from(derefed);
+
+    println!("{:?}", path);
+
+    let mut buffer = [0u8; 2048];
+    let mut foo = Vec::new();
+    
+    let mut headers = HTTPHeader::new();
+
+    
+
+    let _ = stream.read(&mut buffer);
+
+    match headers.parse_req(&buffer) {
+        Ok(_) => {
+            match headers.Type {
+                Some(RequestType::HEAD) => (),
+                Some(RequestType::GET) => (),
+                Some(_) => {
+                    send_error(stream, "501 Not Implemented", "The server does not support the method");
+                    return;
+                },
+                None => {
+                    send_error(stream, "400 Bad Request", "Could not find method");
+                    return;
+                },
+            }
+        },
+        Err(e) => {
+            send_error(stream, "400 Bad Request", e);
+            return;
+        },
+    };
 
 
+    //Require host headers if they use version 1.1
+    match headers.Host {
+        None => match headers.ProtocolVer {
+            Some("1.1") => {
+                send_error(stream, "400 Bad Request", "Missing host header");
+                return;
+            },
+            _ => (),
+        },
+        _ => (),
+    };
 
 
+    if let Some(givenpath) = headers.FilePath {
 
-
-
-
-struct HTTPConn {
-    socket: TcpStream,
-    headers: HTTPHeader,
-    interest: EventSet,
-}
-
-impl HTTPConn {
-    fn new(socket: TcpStream) -> HTTPConn {
-        let headers = HTTPHeader::new();
-
-        HTTPConn {
-            socket: socket,
-            headers: headers,
-            interest: EventSet::readable(),
-        }
+        //Support requests from future versions of HTTP, that sends absolute paths
+        match headers.ProtocolVer {
+            Some("0.9") | Some("1.0") | Some("1.1") => path.push(&givenpath[1..]),
+            _ => {
+                let relpath = from_absolute(&givenpath);
+                path.push(&relpath[1..]);
+            }
+        };   
+        
+    } else {
+        println!("should not happen");
     }
 
-    fn write(&mut self) {
-        //let headers = self.headers;
+
+    let metadata;
+    let mut filehandle;
+
+    if let Ok(mut f) = File::open(path) {
 
 
-        match self.headers.FilePath {
-            Some(ref f) => {self.socket.try_write(RESPONSE.as_bytes()).unwrap();},
-            None    => {println!("heyo");},
+        match f.metadata() {
+            Ok(m) => metadata = m,
+            Err(_) => { 
+                send_error(stream, "404 Not Found", "No such file on the server");
+                return;
+            },
         };
-        /*let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
-                                                 Connection: Upgrade\r\n\
-                                                 Sec-WebSocket-Accept: {}\r\n\
-                                                 Upgrade: websocket\r\n\r\n", response_key));*/
-        self.socket.try_write(RESPONSE.as_bytes()).unwrap();
 
-        self.interest.remove(EventSet::writable());
-        //self.interest.insert(EventSet::readable());
+        filehandle = f;
+
+
+    } else {
+        send_error(stream, "404 Not Found", "No such file on the server");
+        return;
     }
 
-    fn read(&mut self) {
-        loop {
-            let mut buf = [0; 2048];
-            match self.socket.try_read(&mut buf) {
-                Err(e) => {
-                    println!("Error while reading socket: {:?}", e);
-                    return
-                },
-                Ok(None) =>
-                    // Socket buffer has got no more bytes.
-                    break,
-                Ok(Some(len)) => {
-                    //println!("readsocket");
-                    //self.http_parser.parse(&buf);
-                    let res = self.headers.parse_req(&buf);
+    if let Some(time) = headers.IfModifiedSince {
+        let lastmod = metadata.modified().unwrap();
 
-                    if res == Ok(()) {
-                        // Change the current state
-                        //self.state = ClientState::HandshakeResponse;
+        let currenttime = time::get_time();
+        let timesinceifmod = (currenttime - time.to_timespec()).to_std().unwrap();
+        let timesincemod = lastmod.elapsed().unwrap();
 
-                        // Change current interest to `Writable`
-                        self.interest.remove(EventSet::readable());
-                        self.interest.insert(EventSet::writable());
-                        break;
-                    }
-                }
-            }
+        if timesinceifmod < timesincemod {
+            //Not modified since client last saw it
+            send_error(stream, "304 Not Modified", "The requested file has not been modified");
+            return;
         }
     }
-}
 
-struct WebSocketServer {
-    socket: TcpListener,
-    clients: HashMap<Token, HTTPConn>,
-    token_counter: usize
-}
+    if let Some(time) = headers.IfUnmodifiedSince {
+        let lastmod = metadata.modified().unwrap();
 
-const SERVER_TOKEN: Token = Token(0);
+        let currenttime = time::get_time();
+        let timesinceifmod = (currenttime - time.to_timespec()).to_std().unwrap();
+        let timesincemod = lastmod.elapsed().unwrap();
 
-impl Handler for WebSocketServer {
-    type Timeout = usize;
-    type Message = ();
-
-    fn ready(&mut self, event_loop: &mut EventLoop<WebSocketServer>, token: Token, events: EventSet) {
-        if events.is_readable() {
-            match token {
-                SERVER_TOKEN => {
-                    let client_socket = match self.socket.accept() {
-                        Ok(Some((sock, addr))) => sock,
-                        Ok(None) => unreachable!(),
-                        Err(e) => {
-                            println!("Accept error: {}", e);
-                            return;
-                        }
-                    };
-
-                    let new_token = Token(self.token_counter);
-                    self.clients.insert(new_token, HTTPConn::new(client_socket));
-                    self.token_counter += 1;
-
-                    event_loop.register(&self.clients[&new_token].socket, new_token, EventSet::readable(),
-                                        PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                },
-            token => {
-                    let mut client = self.clients.get_mut(&token).unwrap();
-                    client.read();
-                    event_loop.reregister(&client.socket, token, client.interest,
-                                          PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                }
-            }
+        if timesinceifmod > timesincemod {
+            //Modified since client last saw it
+            send_error(stream, "412 Precondition Failed", "The requested file has been modified");
+            return;
         }
 
-        if events.is_writable() {
-            let mut client = self.clients.get_mut(&token).unwrap();
-            client.write();
-            event_loop.reregister(&client.socket, token, client.interest,
-                                  PollOpt::edge() | PollOpt::oneshot()).unwrap();
-        }
     }
+
+
+    if metadata.is_file() {
+
+        match filehandle.read_to_end(&mut foo) {
+            Ok(o) => stream.write_all(&foo).unwrap(),
+            Err(e) => send_error(stream, "404 Not Found", "No such file on the server"),
+        };
+    }
+
+
+    // TCP connection closes after this scope
 }
 
 
+
+fn from_absolute(abspath: &str) -> &str {
+    let url_regex = Regex::new(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?").unwrap();
+
+    let captured = url_regex.captures(abspath).unwrap();
+
+    //fix crashing
+    captured.at(5).expect("Malformed url")
+}
+
+fn send_error(mut stream: TcpStream, error_code: &str, reason: &str) {
+
+    let body = format!("<html>\r\n\
+            <body>\r\n\
+            <h2>Error {}</h2>\r\n\
+            {}\r\n\
+            <html>\r\n\
+            <body>\r\n", error_code, reason);
+
+    let msg = format!("HTTP/1.1 {}\r\n\
+            Content-type: text-html\r\n\
+            Connection: close\r\n\
+            Content-Length: {}\r\n\
+            \r\n\
+            {}", error_code, body.len(), body);
+
+    stream.write_all(msg.as_bytes());
+}
 
 
 
 
 fn main() {
-    //println!("Hello, world!");
+
+    //Command line argument parsing
+    let arguments = App::new("Goose_pond")
+                        .version("0.1")
+                        .author("Christian N")
+                        .about("A simple http file server")
+                        .arg(Arg::with_name("adress")
+                                    .short("a")
+                                    .long("adress")
+                                    .value_name("adress")
+                                    .help("Sets the adress where the servers listens on")
+                                    .takes_value(true))
+                        .arg(Arg::with_name("path")
+                                    .required(true)
+                                    .help("The path to the root folder for the server")
+                                    .index(1))
+                        .arg(Arg::with_name("port")
+                                    .required(true)
+                                    .help("The port the server should listen on")
+                                    .index(2))
+                        .get_matches();
+
+
+    let address = arguments.value_of("adress").unwrap_or("0.0.0.0");
+    let port = arguments.value_of("port").unwrap();
+    let serverroot = arguments.value_of("path").unwrap();
+
+    let path = Arc::new(serverroot.to_string());
+
+    let combined: SocketAddr = match [address, port].join(":").parse() {
+        Ok(a) => a,
+        Err(_) => {
+            println!("{}:{} is not a valid adress", address, port);
+            return;
+        }
+    };
+
+
+
 
 
     let tmpstring = "Connection : close".to_string();
@@ -343,152 +431,23 @@ fn main() {
 
     //println!("{:?}", read_line(test));
 
-    //let addr: SocketAddr = FromStr::from_str("127.0.0.1:5555").unwrap();
+    //let listener = TcpListener::bind("127.0.0.1:5555").unwrap();
+    let listener = TcpListener::bind(combined).unwrap();
 
-    //let listener = TcpListener::bind(&addr).unwrap();
-
-
-
-
-
-    let address = "127.0.0.1:5555".parse::<SocketAddr>().unwrap();
-    let server_socket = TcpListener::bind(&address).unwrap();
-
-    let mut event_loop = EventLoop::new().unwrap();
-
-    let mut server = WebSocketServer {
-        token_counter: 1,
-        clients: HashMap::new(),
-        socket: server_socket
-    };
-
-    event_loop.register(&server.socket,
-                        SERVER_TOKEN,
-                        EventSet::readable(),
-                        PollOpt::edge()).unwrap();
-    event_loop.run(&mut server).unwrap();
-
-
-
-
-
-    /*
-
-
-    // Supporting persistent connections woo
-    mioco::start(move || {
-        for _ in 0..mioco::thread_num() {
-            let listener = listener.try_clone().unwrap();
-            mioco::spawn(move || {
-                loop {
-                    let mut conn = listener.accept().unwrap();
-                    mioco::spawn(move || -> io::Result<()> {
-                        let mut buf_i = 0;
-                        let mut buf = [0u8; 1024];
-                        let mut foo = Vec::new();
-
-                        let mut msg: Vec<u8> = Vec::new();
-
-                        msg.extend_from_slice(RESPONSE.as_bytes());
-                        
-
-                        
-
-
-                            loop {
-                                let mut headers = HTTPHeader::new();
-
-                                let len = try!(conn.read(&mut buf[buf_i..]));
-
-                                if len == 0 {
-                                    // Spurrious event can fire, so check if we actually receive something.
-                                    return Ok(());
-                                }
-
-                                buf_i += len;
-
-                                let res = headers.parse_req(&buf[0..buf_i]);
-
-                                if res == Ok(()) {
-                                    match headers.FilePath {
-                                        Some(path) => {
-
-                                            mioco::sync( || -> io::Result<()> {
-                                                println!("here1");
-                                            let mut f = try!(File::open("foo.txt"));
-                                            println!("here2");
-                                            println!("here3");
-                                            try!(f.read_to_end(&mut foo));
-                                            //println!("{:?}", foo);
-                                            println!("here4");
-
-                                            
-                                            return Ok(());
-                                            }
-                                            );
-                                            println!("writing foo");
-
-                                            msg.append(&mut foo);
-
-                                            try!(conn.write_all(&msg));
-
-                                            //try!(conn.write_all(&foo));
-
-                                            //try!(conn.write_all(&RESPONSE_NULL.as_bytes()));
-
-                                            //try!(conn.write_all(&RESPONSE.as_bytes()));
-                                            
-                                            buf_i = 0;
-                                            return Ok(());
-                                        },                                               
-                                        None       => {
-                                            try!(conn.write_all(&RESPONSE.as_bytes()));
-                                            buf_i = 0;
-                                            return Ok(());
-                                        },
-                                    }
-                                }
-                            }
-                        
-
-
-                        /*
-                        loop {
-                            let mut headers = HTTPHeader::new();
-
-                            let len = try!(conn.read(&mut buf[buf_i..]));
-
-                            if len == 0 {
-                                return Ok(());
-                            }
-
-                            buf_i += len;
-
-                            let res = headers.parse_req(&buf[0..buf_i]);
-
-                            if res == Ok(()) {
-                                //println!("{:?}", headers);
-                                match headers.FilePath {
-                                    Some(path) => {
-                                        try!(conn.write_all(&RESPONSE.as_bytes()));
-                                        buf_i = 0;
-                                    },
-                                    None       => {
-                                        try!(conn.write_all(&RESPONSE.as_bytes()));
-                                        return Ok(());
-                                    },
-                                }
-                            }
-                        }*/
-
-                    });
-                }
-            });
+    // Spawn a thread for each connection
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let clonedpath = path.clone();
+                thread::spawn(move|| {
+                    // connection succeeded
+                    let localpath = &clonedpath;
+                    handle_client(stream, localpath);
+                });
+            }
+            Err(e) => println!("A connection failed: {:?}", e),
         }
-    }).unwrap();
-
-
-    */
+    }
 }
 
 fn date_from_str(s: &str) -> Result<Tm, &'static str> {
