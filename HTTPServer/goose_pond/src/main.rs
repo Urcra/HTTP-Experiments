@@ -2,15 +2,19 @@
 extern crate time;
 extern crate clap;
 extern crate regex;
-
+extern crate chrono;
+extern crate mime_guess;
 
 use std::io::prelude::*;
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::path::Path;
 use std::fs::File;
+use std::fs;
 use clap::{App, Arg, SubCommand};
 use time::*;
+use mime_guess::*;
+use chrono::{Local, UTC, FixedOffset};
 use std::str;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -21,11 +25,6 @@ use regex::Regex;
 //use mioco::tcp::TcpListener;
 
 
-#[derive(Debug)]
-struct ServerConfig {
-    fileroot: String,
-    address: SocketAddr,
-}
 
 
 #[derive(Debug)]
@@ -171,42 +170,16 @@ impl <'a> HTTPHeader<'a> {
         Result::Ok(())
     }
 }
-// Make my own
-const RESPONSE: &'static str = "HTTP/1.1 200 OK\r
-Content-Length: 14\r
-Connection: close\r
-\r
-Hello World\r
-\r";
-
-const RESPONSE_PERS: &'static str = "HTTP/1.1 200 OK\r
-Content-Length: 14\r
-\r
-Hello World\r
-\r";
-
-const RESPONSE_404: &'static str = "HTTP/1.1 404 Not Found\r
-Content-Length: 18\r
-Connection: close\r
-\r
-Hello World_404\r
-\r";
-
-
-const RESPONSE_NULL: &'static str = "\0";
 
 
 fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
 
-    //println!("{:?}", fileroot);
-
     let ref derefed = **fileroot;
     let mut path = PathBuf::from(derefed);
 
-    println!("{:?}", path);
 
     let mut buffer = [0u8; 2048];
-    let mut foo = Vec::new();
+    //let mut foo = Vec::new();
     
     let mut headers = HTTPHeader::new();
 
@@ -249,28 +222,37 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
     };
 
 
-    if let Some(givenpath) = headers.FilePath {
+    if let Some(parsedpath) = headers.FilePath {
+
+        //Spaces are replaced with %20 in requests. So we should reconvert it to spaces.
+        let mut givenpath = parsedpath.to_string().replace("%20", " ");
 
         //Support requests from future versions of HTTP, that sends absolute paths
         match headers.ProtocolVer {
             Some("0.9") | Some("1.0") | Some("1.1") => path.push(&givenpath[1..]),
             _ => {
-                let relpath = from_absolute(&givenpath);
+                let relpath;
+                match from_absolute(&givenpath) {
+                    Some(val) => relpath = val,
+                    None => {
+                        send_error(stream, "400 Bad Request", "Malformed absolute path");
+                        return;
+                    },
+                }
                 path.push(&relpath[1..]);
             }
         };   
         
     } else {
-        println!("should not happen");
+        send_error(stream, "400 Bad Request", "Missing path");
+        return;
     }
 
 
     let metadata;
     let mut filehandle;
 
-    if let Ok(mut f) = File::open(path) {
-
-
+    if let Ok(mut f) = File::open(&path) {
         match f.metadata() {
             Ok(m) => metadata = m,
             Err(_) => { 
@@ -284,6 +266,7 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
 
     } else {
         send_error(stream, "404 Not Found", "No such file on the server");
+        println!("{:?}", &path);
         return;
     }
 
@@ -318,29 +301,114 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
 
 
     if metadata.is_file() {
-
-        match filehandle.read_to_end(&mut foo) {
-            Ok(o) => stream.write_all(&foo).unwrap(),
-            Err(e) => send_error(stream, "404 Not Found", "No such file on the server"),
-        };
+        send_file(stream, path, filehandle);
+    } else {
+        send_index(stream, path);
     }
 
+    //TODO add dates to header
+    //TODO handle index and files
 
     // TCP connection closes after this scope
 }
 
+fn send_file(mut stream: TcpStream, path: PathBuf, mut file: File) {
+    let mut body: Vec<u8> = Vec::new();
 
+    match file.read_to_end(&mut body) {
+        Err(_) => { 
+            send_error(stream, "404 Not Found", "No such file on the server");
+            return;
+        },
+        _ => (),
+    };
 
-fn from_absolute(abspath: &str) -> &str {
+    let mimetype = guess_mime_type(path);
+
+    let msg = format!("HTTP/1.1 200 OK\r\n\
+            Content-type: {}\r\n\
+            Connection: close\r\n\
+            Date: {}\r\n\
+            Content-Length: {}\r\n\
+            \r\n", mimetype, current_time(), body.len());
+
+    stream.write_all(msg.as_bytes());
+    stream.write_all(&body).unwrap();
+}
+
+fn send_index(mut stream: TcpStream, mut path: PathBuf) {
+
+    path.push("index.html");
+
+    match File::open(&path) {
+        Ok(f) => {
+            send_file(stream, path, f);
+            return;
+        }
+        _ => (),
+    }
+
+    let mut indexpage = String::new();
+
+    let dir = path.parent().unwrap();
+
+    let diriterator = match fs::read_dir(dir) {
+        Ok(iter) => iter,
+        Err(_) => {
+            send_error(stream, "404 Not Found", "No such directory on the server");
+            return;
+        },
+    };
+
+    indexpage.push_str(&format!("<html><body><h2>Index of {}/</h2><ul>",
+                         dir.file_name().unwrap().to_str().unwrap()));
+
+    for maybeentry in diriterator {
+        let entry;
+        match maybeentry {
+            Ok(o) => entry = o,
+            Err(_) => continue,
+        };
+        let filetype = entry.file_type().unwrap();
+
+        if filetype.is_dir() {
+            let entry_name = entry.file_name().into_string().unwrap();
+            let fname = format!("<li><a href=\"{}/\">{}/</a></li>", entry_name, entry_name);
+            indexpage.push_str(&fname);
+        } else if filetype.is_file() {
+            let entry_name = entry.file_name().into_string().unwrap();
+            let fname = format!("<li><a href=\"{}\">{}</a></li>", entry_name, entry_name);
+            indexpage.push_str(&fname);
+        }
+
+    }
+
+    indexpage.push_str("</ul></body></html>");
+
+    let msg = format!("HTTP/1.1 200 OK\r\n\
+            Content-type: text-html\r\n\
+            Connection: close\r\n\
+            Date: {}\r\n\
+            Content-Length: {}\r\n\
+            \r\n", current_time(), indexpage.as_bytes().len());
+
+    stream.write_all(msg.as_bytes()).unwrap();
+    stream.write_all(indexpage.as_bytes()).unwrap();
+
+    //unimplemented!();
+}
+
+fn from_absolute(abspath: &str) -> Option<&str> {
     let url_regex = Regex::new(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?").unwrap();
 
     let captured = url_regex.captures(abspath).unwrap();
 
     //fix crashing
-    captured.at(5).expect("Malformed url")
+    captured.at(5)
 }
 
 fn send_error(mut stream: TcpStream, error_code: &str, reason: &str) {
+
 
     let body = format!("<html>\r\n\
             <body>\r\n\
@@ -352,11 +420,17 @@ fn send_error(mut stream: TcpStream, error_code: &str, reason: &str) {
     let msg = format!("HTTP/1.1 {}\r\n\
             Content-type: text-html\r\n\
             Connection: close\r\n\
+            Date: {}\r\n\
             Content-Length: {}\r\n\
             \r\n\
-            {}", error_code, body.len(), body);
+            {}", error_code, current_time(), body.len(), body);
 
     stream.write_all(msg.as_bytes());
+}
+
+fn current_time() -> String {
+    // Get current time in GMT, and format it to be standards compliant
+    Local::now().with_timezone(&FixedOffset::east(0)).to_rfc2822().replace("+0000", "GMT")
 }
 
 
@@ -401,37 +475,6 @@ fn main() {
     };
 
 
-
-
-
-    let tmpstring = "Connection : close".to_string();
-    let tmpinit = "GET /path/file.html HTTP/1.0".to_string();
-
-    let test: &[u8] = "hej \r\n med \r\n dig \r\n lol ".as_bytes();
-
-    let mut tmpheader = HTTPHeader::new();
-
-    tmpheader.insert_tag(&tmpstring);
-    tmpheader.insert_init_line(&tmpinit);
-
-    let message = format!("GET {} HTTP/1.1\r\n\
-                        Host: {}\r\n\
-                        Connection: close\r\n\
-                        User-Agent: SillyGoose/0.1\r\n\
-                        \r\n", "/", "localhost");
-
-    let mut tmpheaders = HTTPHeader::new();
-
-    tmpheaders.parse_req(message.as_bytes());
-
-    //println!("{:?}", tmpheaders);
-
-
-    //println!("{:?}", tmpheader);
-
-    //println!("{:?}", read_line(test));
-
-    //let listener = TcpListener::bind("127.0.0.1:5555").unwrap();
     let listener = TcpListener::bind(combined).unwrap();
 
     // Spawn a thread for each connection
