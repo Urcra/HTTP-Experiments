@@ -5,29 +5,27 @@ extern crate regex;
 extern crate chrono;
 extern crate mime_guess;
 
-use std::io::prelude::*;
-use std::sync::Arc;
-use std::path::PathBuf;
-use std::path::Path;
-use std::fs::File;
-use std::fs;
-use clap::{App, Arg, SubCommand};
+// External libraries
 use time::*;
 use mime_guess::*;
-use chrono::{Local, UTC, FixedOffset};
+use regex::Regex;
+use chrono::{Local, FixedOffset};
+use clap::{App, Arg};
+
+// std libraries
+use std::sync::Arc;
+use std::thread;
+use std::path::PathBuf;
+use std::io::prelude::*;
+use std::fs::File;
+use std::fs;
 use std::str;
 use std::net::SocketAddr;
-use std::str::FromStr;
-//use std::io::{self, Write, Read};
 use std::net::{TcpListener, TcpStream};
-use std::thread;
-use regex::Regex;
-//use mioco::tcp::TcpListener;
 
 
-
-
-#[derive(Debug)]
+/// Internal requesttypes
+#[derive(Debug, PartialEq)]
 enum RequestType {
     GET,
     HEAD,
@@ -40,7 +38,9 @@ enum RequestType {
     UNKNOWN,
 }
 
+/// Structure to allow the parsing of HTTP requests to be a lot less painful
 #[derive(Debug)]
+#[allow(non_snake_case)]
 struct HTTPHeader<'a> {
     //Iinital line
     Protocol: Option<&'a str>,
@@ -55,6 +55,7 @@ struct HTTPHeader<'a> {
 }
 
 impl <'a> HTTPHeader<'a> {
+    /// Creates an empty HTTPHeader
     fn new() -> HTTPHeader<'a>{
         HTTPHeader {
             Protocol: None,
@@ -67,6 +68,8 @@ impl <'a> HTTPHeader<'a> {
             IfUnmodifiedSince: None
         }
     }
+    /// Parses the initial line of a request, and inserts it into the HTTPHeader struct
+    /// Will return errors if the given line is in an incorrect format
     fn insert_init_line(&mut self, s: &'a str) -> Result<&'static str, &'static str> {
 
         let mut splitted = s.split_whitespace();
@@ -74,7 +77,9 @@ impl <'a> HTTPHeader<'a> {
 
         let initline;
 
-
+        // Checks that the request line contains a protocol, a path and a requesttype
+        // splitted is an iterator so .nth() advances the iterator to the next step.
+        // So this corrosponds to splitted[0] splitted[1] splitted[2]
         match (splitted.nth(0), splitted.nth(0), splitted.nth(0)) {
             (None, _, _) => return Result::Err("Invalid init line"),
             (_, None, _) => return Result::Err("Invalid init line"),
@@ -92,9 +97,10 @@ impl <'a> HTTPHeader<'a> {
 
         let middle;
 
+        // Split the protocol into two for easier acccess
         match fullprot.find("/") {
             Some(i) => middle = i,
-            None => return Result::Err("Invalid header format"),
+            None => return Result::Err("Invalid protocol format"),
         };
 
 
@@ -108,9 +114,13 @@ impl <'a> HTTPHeader<'a> {
         Result::Ok("OK")
     }
 
+    /// inserts a header tag into the HTTPHeader struct. 
+    /// Expects the line to contain a header, but will return an error if the header was malformed
+    /// If the header is unsupport this returns a success but with the message "Unknown header"
     fn insert_tag(&mut self, s: &'a str) -> Result<&'static str, &'static str>{
         let middle;
 
+        // Split the headers at ':'
         match s.find(":") {
             Some(i) => middle = i,
             None => return Result::Err("Invalid header format"),
@@ -118,7 +128,7 @@ impl <'a> HTTPHeader<'a> {
 
         let (header, tag) = s.split_at(middle);
 
-
+        // Match the header with supported headers
         match header.trim() {
             "Connection" => self.Connection = Some(tag[1..].trim()),
             "Host" => self.Host = Some(tag[1..].trim()),
@@ -126,7 +136,7 @@ impl <'a> HTTPHeader<'a> {
                             Ok(t) => self.IfModifiedSince = Some(t),
                             Err(e) => return Result::Err(e),
                             },
-            "If-Content-Length: 14\rUnmodified-Since" => match date_from_str(tag[1..].trim()) {
+            "If-Unmodified-Since" => match date_from_str(tag[1..].trim()) {
                             Ok(t) => self.IfUnmodifiedSince = Some(t),
                             Err(e) => return Result::Err(e),
                             },
@@ -137,6 +147,8 @@ impl <'a> HTTPHeader<'a> {
         Result::Ok("OK")
     }
 
+    /// Fills up the HTTPHeader struct, by parsing a given buffer
+    /// Will return an error if something was wrong with the format of the request
     fn parse_req(&mut self, req: &'a [u8]) -> Result<(),&'static str>{
 
         let mut len = 0;
@@ -144,7 +156,11 @@ impl <'a> HTTPHeader<'a> {
         //Parse initialline
         match read_line(req) {
             Ok(s) => {
-                self.insert_init_line(s.trim());
+                match self.insert_init_line(s.trim()) {
+                    Err(e) => return Result::Err(e),
+                    _ => (),
+                };
+
                 len += s.len()
             },
             Err(_) => return Result::Err("Missing line ending"),
@@ -171,39 +187,98 @@ impl <'a> HTTPHeader<'a> {
     }
 }
 
+/// Attempts to parse the date written as either of these formats
+/// Fri, 31 Dec 1999 23:59:59 GMT
+/// Friday, 31-Dec-99 23:59:59 GMT
+/// Fri Dec 31 23:59:59 1999
+/// Will return an error if it's unable to parse the date
+fn date_from_str(s: &str) -> Result<Tm, &'static str> {
+    match   time::strptime(s, "%a, %d %b %Y %T %Z").or_else(|_| {
+            time::strptime(s, "%A, %d-%b-%y %T %Z")}).or_else(|_| {
+            time::strptime(s, "%c")}){
+                Ok(t) => Ok(t),
+                Err(_) => Err("Unable to parse date"),
+                }
+}
 
+/// Converts a string into an internal RequestType for better error handling
+fn reqtype_from_str(req: &str) -> RequestType {
+    match req {
+        "GET" => RequestType::GET,
+        "HEAD" => RequestType::HEAD,
+        "POST" => RequestType::POST,
+        "PUT" => RequestType::PUT,
+        "DELETE" => RequestType::DELETE,
+        "OPTIONS" => RequestType::OPTIONS,
+        "TRACE" => RequestType::TRACE,
+        _ => RequestType::UNKNOWN,
+    }
+}
+
+/// Reads from the buf until it hits a newline.
+/// Then reports back the slice until and containing the newline
+/// Will return an error if buffer is an incorrect type
+fn read_line(buf: &[u8]) -> Result<&str, Option<&str>> {
+    let slice_res = str::from_utf8(buf);
+
+    let slice;
+
+    // Check if we can convert the buffer to a string
+    match slice_res {
+        Ok(s) => slice = s,
+        Err(_) => return Result::Err(None),
+    }
+
+    let end_of_line;
+
+    match slice.find("\r\n") {
+        Some(i) => end_of_line = i,
+        None => return Result::Err(Some(&slice)),
+    }
+
+    Result::Ok(&slice[..end_of_line + 2])
+}
+
+/// Called for each client connecting to the server
 fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
 
     let ref derefed = **fileroot;
     let mut path = PathBuf::from(derefed);
-
-
-    let mut buffer = [0u8; 2048];
-    //let mut foo = Vec::new();
     
+    // 2k bytes should be enough for the headers
+    let mut buffer = [0u8; 2048];
+
+
     let mut headers = HTTPHeader::new();
 
-    
+    // Pre initalize requesttype
+    // Since otherwise if the request was horribly malformed we might now get a request
+    // And then wouldn't know if we should send the body with or not
+    let mut requesttype = RequestType::GET;
 
+
+    // Read into the buffer
     let _ = stream.read(&mut buffer);
 
+
+    // Try to parse the request, if it fails send the error message back
     match headers.parse_req(&buffer) {
         Ok(_) => {
             match headers.Type {
-                Some(RequestType::HEAD) => (),
-                Some(RequestType::GET) => (),
+                Some(RequestType::HEAD) => requesttype = RequestType::HEAD,
+                Some(RequestType::GET) => requesttype = RequestType::GET,
                 Some(_) => {
-                    send_error(stream, "501 Not Implemented", "The server does not support the method");
+                    send_error(stream, "501 Not Implemented", "The server does not support the method", requesttype);
                     return;
                 },
                 None => {
-                    send_error(stream, "400 Bad Request", "Could not find method");
+                    send_error(stream, "400 Bad Request", "Could not find method", requesttype);
                     return;
                 },
             }
         },
         Err(e) => {
-            send_error(stream, "400 Bad Request", e);
+            send_error(stream, "400 Bad Request", e, requesttype);
             return;
         },
     };
@@ -213,7 +288,7 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
     match headers.Host {
         None => match headers.ProtocolVer {
             Some("1.1") => {
-                send_error(stream, "400 Bad Request", "Missing host header");
+                send_error(stream, "400 Bad Request", "Missing host header", requesttype);
                 return;
             },
             _ => (),
@@ -222,10 +297,12 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
     };
 
 
+    // Doing some work, with the path given in the request
+    // To see if it is valid
     if let Some(parsedpath) = headers.FilePath {
 
         //Spaces are replaced with %20 in requests. So we should reconvert it to spaces.
-        let mut givenpath = parsedpath.to_string().replace("%20", " ");
+        let givenpath = parsedpath.to_string().replace("%20", " ");
 
         //Support requests from future versions of HTTP, that sends absolute paths
         match headers.ProtocolVer {
@@ -235,7 +312,7 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
                 match from_absolute(&givenpath) {
                     Some(val) => relpath = val,
                     None => {
-                        send_error(stream, "400 Bad Request", "Malformed absolute path");
+                        send_error(stream, "400 Bad Request", "Malformed absolute path", requesttype);
                         return;
                     },
                 }
@@ -244,32 +321,31 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
         };   
         
     } else {
-        send_error(stream, "400 Bad Request", "Missing path");
+        send_error(stream, "400 Bad Request", "Missing path", requesttype);
         return;
     }
 
 
     let metadata;
-    let mut filehandle;
+    let filehandle;
 
-    if let Ok(mut f) = File::open(&path) {
+    // Try to open the requested file. Report back errors
+    if let Ok(f) = File::open(&path) {
         match f.metadata() {
             Ok(m) => metadata = m,
             Err(_) => { 
-                send_error(stream, "404 Not Found", "No such file on the server");
+                send_error(stream, "404 Not Found", "No such file on the server", requesttype);
                 return;
             },
         };
 
         filehandle = f;
-
-
     } else {
-        send_error(stream, "404 Not Found", "No such file on the server");
-        println!("{:?}", &path);
+        send_error(stream, "404 Not Found", "No such file on the server", requesttype);
         return;
     }
 
+    // Handle the If-Modified-Since header
     if let Some(time) = headers.IfModifiedSince {
         let lastmod = metadata.modified().unwrap();
 
@@ -279,11 +355,12 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
 
         if timesinceifmod < timesincemod {
             //Not modified since client last saw it
-            send_error(stream, "304 Not Modified", "The requested file has not been modified");
+            send_error(stream, "304 Not Modified", "The requested file has not been modified", requesttype);
             return;
         }
     }
 
+    // Handle the If-Unmodified-Since header
     if let Some(time) = headers.IfUnmodifiedSince {
         let lastmod = metadata.modified().unwrap();
 
@@ -293,38 +370,40 @@ fn handle_client(mut stream: TcpStream, fileroot: &Arc<String>) {
 
         if timesinceifmod > timesincemod {
             //Modified since client last saw it
-            send_error(stream, "412 Precondition Failed", "The requested file has been modified");
+            send_error(stream, "412 Precondition Failed", "The requested file has been modified", requesttype);
             return;
         }
 
     }
 
-
+    // Check if we should serve an index page or just a file
     if metadata.is_file() {
-        send_file(stream, path, filehandle);
+        send_file(stream, path, filehandle, requesttype);
     } else {
-        send_index(stream, path);
+        send_index(stream, path, requesttype);
     }
-
-    //TODO add dates to header
-    //TODO handle index and files
 
     // TCP connection closes after this scope
 }
 
-fn send_file(mut stream: TcpStream, path: PathBuf, mut file: File) {
+/// Attempts to open the file, and sends it with the appropriate headers over a tcp stream
+/// Will send errors if the file can't be opened
+fn send_file(mut stream: TcpStream, path: PathBuf, mut file: File, req: RequestType) {
     let mut body: Vec<u8> = Vec::new();
 
+    //Try to read the contents from the file into the body
     match file.read_to_end(&mut body) {
         Err(_) => { 
-            send_error(stream, "404 Not Found", "No such file on the server");
+            send_error(stream, "404 Not Found", "No such file on the server", req);
             return;
         },
         _ => (),
     };
 
+    // Use a utility to guess the type of the file.
     let mimetype = guess_mime_type(path);
 
+    // Create the headers for the http response
     let msg = format!("HTTP/1.1 200 OK\r\n\
             Content-type: {}\r\n\
             Connection: close\r\n\
@@ -332,17 +411,23 @@ fn send_file(mut stream: TcpStream, path: PathBuf, mut file: File) {
             Content-Length: {}\r\n\
             \r\n", mimetype, current_time(), body.len());
 
-    stream.write_all(msg.as_bytes());
-    stream.write_all(&body).unwrap();
+    // Write the headers over the stream
+    let _ = stream.write_all(msg.as_bytes());
+
+    // If it's a GET method also write the body
+    if req == RequestType::GET {
+        let _ = stream.write_all(&body);
+    }    
 }
 
-fn send_index(mut stream: TcpStream, mut path: PathBuf) {
+fn send_index(mut stream: TcpStream, mut path: PathBuf, req: RequestType) {
 
     path.push("index.html");
 
+    // Check if a index.html file exists
     match File::open(&path) {
         Ok(f) => {
-            send_file(stream, path, f);
+            send_file(stream, path, f, req);
             return;
         }
         _ => (),
@@ -352,17 +437,20 @@ fn send_index(mut stream: TcpStream, mut path: PathBuf) {
 
     let dir = path.parent().unwrap();
 
+    // Create an iterator over all of entrys in the folder
     let diriterator = match fs::read_dir(dir) {
         Ok(iter) => iter,
         Err(_) => {
-            send_error(stream, "404 Not Found", "No such directory on the server");
+            send_error(stream, "404 Not Found", "No such directory on the server", req);
             return;
         },
     };
 
+    // Format the index kinda nicely
     indexpage.push_str(&format!("<html><body><h2>Index of {}/</h2><ul>",
                          dir.file_name().unwrap().to_str().unwrap()));
 
+    // For each entry check if it can be opened, and then add them to the index page
     for maybeentry in diriterator {
         let entry;
         match maybeentry {
@@ -381,6 +469,7 @@ fn send_index(mut stream: TcpStream, mut path: PathBuf) {
             indexpage.push_str(&fname);
         }
 
+
     }
 
     indexpage.push_str("</ul></body></html>");
@@ -392,49 +481,52 @@ fn send_index(mut stream: TcpStream, mut path: PathBuf) {
             Content-Length: {}\r\n\
             \r\n", current_time(), indexpage.as_bytes().len());
 
-    stream.write_all(msg.as_bytes()).unwrap();
-    stream.write_all(indexpage.as_bytes()).unwrap();
+    // Send the headers back
+    let _ = stream.write_all(msg.as_bytes());
 
-    //unimplemented!();
+    // If the request was a get send the generated index page back
+    if req == RequestType::GET {
+        let _ = stream.write_all(indexpage.as_bytes());
+    }
 }
 
+/// Extracts the reletive path out of a absolute path.
 fn from_absolute(abspath: &str) -> Option<&str> {
     let url_regex = Regex::new(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?").unwrap();
 
     let captured = url_regex.captures(abspath).unwrap();
 
-    //fix crashing
     captured.at(5)
 }
 
-fn send_error(mut stream: TcpStream, error_code: &str, reason: &str) {
-
+/// Send an error message back over the TCP stream
+fn send_error(mut stream: TcpStream, error_code: &str, reason: &str, req: RequestType) {
 
     let body = format!("<html>\r\n\
             <body>\r\n\
             <h2>Error {}</h2>\r\n\
             {}\r\n\
-            <html>\r\n\
-            <body>\r\n", error_code, reason);
+            </body>\r\n\
+            </html>\r\n", error_code, reason);
 
     let msg = format!("HTTP/1.1 {}\r\n\
             Content-type: text-html\r\n\
             Connection: close\r\n\
             Date: {}\r\n\
             Content-Length: {}\r\n\
-            \r\n\
-            {}", error_code, current_time(), body.len(), body);
+            \r\n", error_code, current_time(), body.len());
 
-    stream.write_all(msg.as_bytes());
+    let _ = stream.write_all(msg.as_bytes());
+
+    if req == RequestType::GET {
+        let _ = stream.write_all(body.as_bytes());
+    }
 }
 
+/// Get current time in GMT, and format it to be standards compliant
 fn current_time() -> String {
-    // Get current time in GMT, and format it to be standards compliant
     Local::now().with_timezone(&FixedOffset::east(0)).to_rfc2822().replace("+0000", "GMT")
 }
-
-
-
 
 fn main() {
 
@@ -459,13 +551,14 @@ fn main() {
                                     .index(2))
                         .get_matches();
 
-
+    // Set the adress to the given adress, or to 0.0.0.0 if none was given
     let address = arguments.value_of("adress").unwrap_or("0.0.0.0");
     let port = arguments.value_of("port").unwrap();
     let serverroot = arguments.value_of("path").unwrap();
 
     let path = Arc::new(serverroot.to_string());
 
+    // Check if the adress combined with the port corrosponds to a valid adress we can listen on
     let combined: SocketAddr = match [address, port].join(":").parse() {
         Ok(a) => a,
         Err(_) => {
@@ -493,44 +586,3 @@ fn main() {
     }
 }
 
-fn date_from_str(s: &str) -> Result<Tm, &'static str> {
-    match   time::strptime(s, "%a, %d %b %Y %T %Z").or_else(|_| {
-            time::strptime(s, "%A, %d-%b-%y %T %Z")}).or_else(|_| {
-            time::strptime(s, "%c")}){
-                Ok(t) => Ok(t),
-                Err(_) => Err("Unable to parse date"),
-                }
-}
-
-fn reqtype_from_str(req: &str) -> RequestType {
-    match req {
-        "GET" => RequestType::GET,
-        "HEAD" => RequestType::HEAD,
-        "POST" => RequestType::POST,
-        "PUT" => RequestType::PUT,
-        "DELETE" => RequestType::DELETE,
-        "OPTIONS" => RequestType::OPTIONS,
-        "TRACE" => RequestType::TRACE,
-        _ => RequestType::UNKNOWN,
-    }
-}
-
-fn read_line(buf: &[u8]) -> Result<&str, Option<&str>> {
-    let slice_res = str::from_utf8(buf);
-
-    let slice;
-
-    match slice_res {
-        Ok(s) => slice = s,
-        Err(_) => return Result::Err(None),
-    }
-
-    let end_of_line;
-
-    match slice.find("\r\n") {
-        Some(i) => end_of_line = i,
-        None => return Result::Err(Some(&slice)),
-    }
-
-    Result::Ok(&slice[..end_of_line + 2])
-}
