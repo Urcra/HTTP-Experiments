@@ -1,8 +1,8 @@
 #![feature(fs_time)] 
 extern crate time;
+extern crate chrono;
 extern crate clap;
 extern crate regex;
-extern crate chrono;
 extern crate mime_guess;
 
 // External libraries
@@ -491,7 +491,7 @@ fn send_index(mut stream: TcpStream, mut path: PathBuf, req: RequestType) {
     indexpage.push_str("</ul></body></html>");
 
     let msg = format!("HTTP/1.1 200 OK\r\n\
-            Content-type: text-html\r\n\
+            Content-type: text/html\r\n\
             Connection: close\r\n\
             Date: {}\r\n\
             Content-Length: {}\r\n\
