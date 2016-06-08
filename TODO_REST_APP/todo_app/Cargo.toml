@@ -5,3 +5,5 @@ authors = ["Urcra <urcra@urcra.com>"]
 
 [dependencies]
 nickel = "*"
+rustc-serialize = "*"
+rusqlite = "0.7.3"

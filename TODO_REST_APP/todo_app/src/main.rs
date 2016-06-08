@@ -1,9 +1,33 @@
 #[macro_use] 
 extern crate nickel;
+extern crate rustc_serialize;
+extern crate rusqlite;
 
-use nickel::{Nickel, JsonBody, Mountable, HttpRouter, Request, Response, MiddlewareResult, MediaType,  StaticFilesHandler};
+use nickel::{Nickel, JsonBody, HttpRouter, Request, Response, MiddlewareResult, MediaType,  StaticFilesHandler};
+use rusqlite::Connection;
+
+use rustc_serialize::json::{Json, ToJson};
+use std::prelude::*;
+
+
+// Use postgres for database
+
+#[derive(RustcDecodable, RustcEncodable, Debug)]
+struct TodoItem {
+    id: Option<usize>,
+    text: Option<String>,
+    completed: Option<bool>
+}
+
+#[derive(RustcDecodable, RustcEncodable, Debug)]
+struct JsonRequest {
+    todo: TodoItem
+}
 
 fn main() {
+
+
+    let dbconn = Connection::open("app.db").unwrap();
 
     let mut server = Nickel::new();
     let mut router = Nickel::router();
@@ -26,7 +50,17 @@ fn main() {
     router.post("/todo/", middleware! { |request, response|
         // Insert stuff and return what we inserted
 
-        format!("Trying to create a new TODO list")
+        let jsonreq = request.json_as::<JsonRequest>().unwrap();
+
+        let todoitem = jsonreq.todo;
+
+        let text = todoitem.text.unwrap().to_string();
+
+        //let newtodo = request.json_as::<TodoItem>().unwrap();
+
+        //let text = newtodo.text.unwrap().to_string();
+
+        format!("Trying to create a new TODO list with text {:?}", text)
 
     });
 
